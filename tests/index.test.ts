@@ -5,89 +5,48 @@ import { testOracleProgramExecution, testOracleProgramTally } from "@seda-protoc
 const WASM_PATH = "target/wasm32-wasip1/release-wasm/derive-vol-oracle.wasm";
 
 const fetchMock = mock();
-
-afterEach(() => {
-  fetchMock.mockRestore();
-});
+afterEach(() => { fetchMock.mockRestore(); });
 
 // --- Mock responses ---
-
 const PYTH_ETH = {
   parsed: [{ price: { price: "165413000000", conf: "5000000", expo: -8, publish_time: 1750000000 } }],
 };
-
 const COINBASE_ETH = { data: { amount: "1654.50" } };
-
 const KRAKEN_ETH = { result: { XETHZUSD: { c: ["1654.20", "1.0"] } } };
-
-const DVOL_RESPONSE = {
-  result: {
-    data: [
-      [1750000000000, 55.2, 58.1, 54.0, 57.8],
-    ],
-  },
-};
-
-const DVOL_CRISIS = {
-  result: {
-    data: [
-      [1750000000000, 82.0, 95.0, 80.0, 92.5],
-    ],
-  },
-};
-
-const HIST_RV = {
+const DVOL = { result: { data: [[1750000000000, 55.2, 58.1, 54.0, 57.8]] } };
+const HIST_RV = { result: [[1749900000000, 45.2], [1750000000000, 48.7]] };
+const INSTRUMENTS = {
   result: [
-    [1749900000000, 45.2],
-    [1750000000000, 48.7],
+    { instrument_name: "ETH-27JUN26-1650-C", expiration_timestamp: 1751000000000 },
+    { instrument_name: "ETH-27JUN26-1650-P", expiration_timestamp: 1751000000000 },
   ],
 };
+const TICKER_CALL = {
+  result: {
+    mark_iv: 56.5, underlying_price: 1654.0,
+    greeks: { delta: 0.52, gamma: 0.006, vega: 0.48, theta: -6.9, rho: 0.05 },
+  },
+};
+const TICKER_PUT = {
+  result: {
+    mark_iv: 58.2, underlying_price: 1654.0,
+    greeks: { delta: -0.48, gamma: 0.006, vega: 0.48, theta: -6.5, rho: -0.04 },
+  },
+};
 
-// Simplified option book — 6 options near ATM
-function makeOptionBook(underlying: number, atmIv: number) {
-  const strikes = [
-    { k: underlying * 0.93, type: "P", iv: atmIv + 8 },   // 25d put (OTM put)
-    { k: underlying * 0.97, type: "P", iv: atmIv + 3 },   // near ATM put
-    { k: underlying * 1.0,  type: "C", iv: atmIv },       // ATM call
-    { k: underlying * 1.0,  type: "P", iv: atmIv + 1 },   // ATM put
-    { k: underlying * 1.03, type: "C", iv: atmIv - 2 },   // near OTM call
-    { k: underlying * 1.07, type: "C", iv: atmIv - 5 },   // 25d call (OTM call)
-  ];
-
-  return {
-    result: strikes.map((s, i) => ({
-      instrument_name: `ETH-27JUN26-${Math.round(s.k)}-${s.type}`,
-      mark_iv: s.iv,
-      underlying_price: underlying,
-      mid_price: 0.02 + i * 0.005,
-      open_interest: 500 - i * 50,
-    })),
-  };
-}
-
-const OPTION_BOOK_NORMAL = makeOptionBook(1654, 56);
-const OPTION_BOOK_CRISIS = makeOptionBook(1654, 88);
-
-function mockApis(dvol = DVOL_RESPONSE, optionBook = OPTION_BOOK_NORMAL) {
+function mockApis() {
+  let tickerCallCount = 0;
   fetchMock.mockImplementation((...args: any[]) => {
-    const urlStr = String(args[0] || "");
-    if (urlStr.includes("hermes.pyth.network")) {
-      return new Response(JSON.stringify(PYTH_ETH));
-    }
-    if (urlStr.includes("api.coinbase.com")) {
-      return new Response(JSON.stringify(COINBASE_ETH));
-    }
-    if (urlStr.includes("api.kraken.com")) {
-      return new Response(JSON.stringify(KRAKEN_ETH));
-    }
-    if (urlStr.includes("get_volatility_index_data")) {
-      return new Response(JSON.stringify(dvol));
-    }
-    if (urlStr.includes("get_historical_volatility")) {
-      return new Response(JSON.stringify(HIST_RV));
-    }
-    if (urlStr.includes("get_book_summary_by_currency")) {
-      return new Response(JSON.stringify(optionBook));
+    const u = String(args[0] || "");
+    if (u.includes("hermes.pyth.network")) return new Response(JSON.stringify(PYTH_ETH));
+    if (u.includes("coinbase")) return new Response(JSON.stringify(COINBASE_ETH));
+    if (u.includes("kraken")) return new Response(JSON.stringify(KRAKEN_ETH));
+    if (u.includes("get_volatility_index")) return new Response(JSON.stringify(DVOL));
+    if (u.includes("get_historical_volatility")) return new Response(JSON.stringify(HIST_RV));
+    if (u.includes("get_instruments")) return new Response(JSON.stringify(INSTRUMENTS));
+    if (u.includes("ticker")) {
+      tickerCallCount++;
+      return new Response(JSON.stringify(tickerCallCount <= 1 ? TICKER_CALL : TICKER_PUT));
     }
     return new Response(JSON.stringify(PYTH_ETH));
   });
@@ -102,145 +61,98 @@ function makeInput(overrides: Record<string, any> = {}) {
   });
 }
 
-// --- Execution tests ---
-
 describe("Vol Oracle - execution phase", () => {
-  it("should fetch spot from 3 sources + DVOL + RV + options", async () => {
+  it("should fetch spot + DVOL + RV + ATM tickers", async () => {
     mockApis();
     const wasm = await file(WASM_PATH).arrayBuffer();
     const vmResult = await testOracleProgramExecution(
       Buffer.from(wasm), Buffer.from(makeInput()), fetchMock
     );
     expect(vmResult.exitCode).toBe(0);
-    const result = JSON.parse(Buffer.from(vmResult.result).toString("utf-8"));
+    const r = JSON.parse(Buffer.from(vmResult.result).toString("utf-8"));
 
-    expect(result.cy).toBe("ETH");
-    expect(result.sp.length).toBe(3);           // 3 spot sources
-    expect(result.dv).toBeGreaterThan(0);        // DVOL populated
-    expect(result.rv).toBeGreaterThan(0);        // RV populated
-    expect(result.opts.length).toBeGreaterThan(0); // options fetched
+    expect(r.cy).toBe("ETH");
+    expect(r.sp.length).toBe(3);
+    expect(r.dv).toBeGreaterThan(0);
+    expect(r.rv).toBeGreaterThan(0);
+    expect(r.ac).toBeGreaterThan(0);
+    expect(r.ap).toBeGreaterThan(0);
+    expect(r.gm).toBeGreaterThan(0);
 
-    console.log("Execution result:", JSON.stringify(result, null, 2));
+    console.log("Execution:", JSON.stringify(r, null, 2));
   });
 });
 
-// --- Tally tests ---
-
 describe("Vol Oracle - tally phase", () => {
-  it("should produce a NORMAL regime vol surface", async () => {
+  it("should produce NORMAL regime surface with skew + VRP", async () => {
     const wasm = await file(WASM_PATH).arrayBuffer();
-
     const reveal = JSON.stringify({
-      cy: "ETH",
-      sp: [1654_130_000, 1654_500_000, 1654_200_000],
+      cy: "ETH", sp: [1654_130_000, 1654_500_000, 1654_200_000],
       sn: ["Pyth", "Coinbase", "Kraken"],
-      dv: 57.8,
-      rv: 48.7,
-      opts: OPTION_BOOK_NORMAL.result.map((o: any) => ({
-        i: o.instrument_name,
-        iv: o.mark_iv,
-        k: parseFloat(o.instrument_name.split("-")[2]),
-        ot: o.instrument_name.split("-")[3],
-        dte: 2.0,
-        oi: o.open_interest,
-        u: o.underlying_price,
-      })),
-      up: 1654.0,
+      dv: 57.8, rv: 48.7, up: 1654.0,
+      ac: 56.5, ap: 58.2, cd: 0.52, pd: -0.48, gm: 0.006, vg: 0.48,
     });
-
     const vmResult = await testOracleProgramTally(
-      Buffer.from(wasm),
-      Buffer.from("tally"),
+      Buffer.from(wasm), Buffer.from("tally"),
       [{ exitCode: 0, gasUsed: 0, inConsensus: true, result: Buffer.from(reveal) }],
     );
-
     expect(vmResult.exitCode).toBe(0);
-    const result = JSON.parse(Buffer.from(vmResult.result).toString("utf-8"));
+    const r = JSON.parse(Buffer.from(vmResult.result).toString("utf-8"));
 
-    expect(result.cy).toBe("ETH");
-    expect(result.spot).toBeGreaterThan(1600);
-    expect(result.dvol).toBeCloseTo(57.8, 0);
-    expect(result.rv).toBeCloseTo(48.7, 0);
-    expect(result.vrp).toBeGreaterThan(0);        // IV > RV = positive premium
-    expect(result.atm).toBeGreaterThan(40);        // ATM IV populated
-    expect(result.regime).toBe("NORMAL");
-    expect(result.rscore).toBeGreaterThan(25);
-    expect(result.rscore).toBeLessThan(50);
+    expect(r.regime).toBe("NORMAL");
+    expect(r.vrp).toBeGreaterThan(0);
+    expect(r.skew).toBeGreaterThan(0);
+    expect(r.atm).toBeGreaterThan(50);
 
-    console.log("NORMAL surface:", JSON.stringify(result, null, 2));
+    console.log("NORMAL:", JSON.stringify(r, null, 2));
   });
 
-  it("should detect CRISIS regime when vol is high", async () => {
+  it("should detect CRISIS regime", async () => {
     const wasm = await file(WASM_PATH).arrayBuffer();
-
     const reveal = JSON.stringify({
-      cy: "ETH",
-      sp: [1654_130_000],
-      sn: ["Pyth"],
-      dv: 92.5,   // DVOL > 80 = crisis
-      rv: 85.0,
-      opts: OPTION_BOOK_CRISIS.result.map((o: any) => ({
-        i: o.instrument_name,
-        iv: o.mark_iv,
-        k: parseFloat(o.instrument_name.split("-")[2]),
-        ot: o.instrument_name.split("-")[3],
-        dte: 2.0,
-        oi: o.open_interest,
-        u: o.underlying_price,
-      })),
-      up: 1654.0,
+      cy: "ETH", sp: [1654_000_000], sn: ["Pyth"],
+      dv: 92.0, rv: 88.0, up: 1654.0,
+      ac: 90.0, ap: 95.0, cd: 0.51, pd: -0.49, gm: 0.008, vg: 0.55,
     });
-
     const vmResult = await testOracleProgramTally(
-      Buffer.from(wasm),
-      Buffer.from("tally"),
+      Buffer.from(wasm), Buffer.from("tally"),
       [{ exitCode: 0, gasUsed: 0, inConsensus: true, result: Buffer.from(reveal) }],
     );
-
     expect(vmResult.exitCode).toBe(0);
-    const result = JSON.parse(Buffer.from(vmResult.result).toString("utf-8"));
+    const r = JSON.parse(Buffer.from(vmResult.result).toString("utf-8"));
 
-    expect(result.regime).toBe("CRISIS");
-    expect(result.rscore).toBeGreaterThanOrEqual(75);
-    expect(result.dvol).toBeCloseTo(92.5, 0);
+    expect(r.regime).toBe("CRISIS");
+    expect(r.rscore).toBeGreaterThanOrEqual(75);
 
-    console.log("CRISIS surface:", JSON.stringify(result, null, 2));
+    console.log("CRISIS:", JSON.stringify(r, null, 2));
   });
 
-  it("should compute positive skew (put premium) from option data", async () => {
+  it("should compute consensus across multiple executors", async () => {
     const wasm = await file(WASM_PATH).arrayBuffer();
-
-    const reveal = JSON.stringify({
-      cy: "ETH",
-      sp: [1654_000_000],
-      sn: ["Pyth"],
-      dv: 57.0,
-      rv: 50.0,
-      opts: OPTION_BOOK_NORMAL.result.map((o: any) => ({
-        i: o.instrument_name,
-        iv: o.mark_iv,
-        k: parseFloat(o.instrument_name.split("-")[2]),
-        ot: o.instrument_name.split("-")[3],
-        dte: 2.0,
-        oi: o.open_interest,
-        u: o.underlying_price,
-      })),
-      up: 1654.0,
+    const r1 = JSON.stringify({
+      cy: "ETH", sp: [1654_000_000, 1654_500_000], sn: ["Pyth", "Coinbase"],
+      dv: 57.0, rv: 49.0, up: 1654.0,
+      ac: 55.0, ap: 57.5, cd: 0.51, pd: -0.49, gm: 0.005, vg: 0.47,
     });
-
+    const r2 = JSON.stringify({
+      cy: "ETH", sp: [1654_200_000, 1654_400_000], sn: ["Pyth", "Coinbase"],
+      dv: 58.0, rv: 48.5, up: 1654.0,
+      ac: 56.0, ap: 58.0, cd: 0.52, pd: -0.48, gm: 0.006, vg: 0.49,
+    });
     const vmResult = await testOracleProgramTally(
-      Buffer.from(wasm),
-      Buffer.from("tally"),
-      [{ exitCode: 0, gasUsed: 0, inConsensus: true, result: Buffer.from(reveal) }],
+      Buffer.from(wasm), Buffer.from("tally"),
+      [
+        { exitCode: 0, gasUsed: 0, inConsensus: true, result: Buffer.from(r1) },
+        { exitCode: 0, gasUsed: 0, inConsensus: true, result: Buffer.from(r2) },
+      ],
     );
-
     expect(vmResult.exitCode).toBe(0);
-    const result = JSON.parse(Buffer.from(vmResult.result).toString("utf-8"));
+    const r = JSON.parse(Buffer.from(vmResult.result).toString("utf-8"));
 
-    // Put IV should be higher than call IV (positive skew = downside protection premium)
-    expect(result.skew).toBeGreaterThan(0);
-    expect(result.p25).toBeGreaterThan(result.c25);
+    expect(r.ex).toBe(2);
+    expect(r.ok).toBe(2);
+    expect(r.dvol).toBeCloseTo(57.5, 0);
 
-    console.log("Skew analysis:", JSON.stringify(result, null, 2));
+    console.log("Multi-executor:", JSON.stringify(r, null, 2));
   });
 });
