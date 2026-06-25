@@ -1,0 +1,23 @@
+{
+  "name": "derive-vol-oracle",
+  "version": "1.0.0",
+  "description": "Decentralized volatility surface oracle — ATM IV, skew, term structure, realized vol, regime detection. Built on SEDA for Derive.",
+  "type": "module",
+  "scripts": {
+    "build": "make build",
+    "deploy": "bun run build && bunx seda-sdk oracle-program upload ./target/wasm32-wasip1/release-wasm/derive-vol-oracle.wasm",
+    "test": "bun test tests/ src/"
+  },
+  "keywords": ["seda", "oracle", "derive", "volatility", "options", "implied-vol", "greeks", "wasm"],
+  "license": "MIT",
+  "devDependencies": {
+    "@seda-protocol/dev-tools": "^1.0.3",
+    "@types/bun": "^1.2.22",
+    "bignumber.js": "^9.3.1",
+    "binaryen": "^124.0.0",
+    "wabt": "^1.0.37"
+  },
+  "dependencies": {
+    "@seda-protocol/vm": "^1.1.0"
+  }
+}

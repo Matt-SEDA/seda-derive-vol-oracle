@@ -1,0 +1,15 @@
+[package]
+name = "derive-vol-oracle"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", default-features = false }
+serde_json = "1.0"
+seda-sdk-rs = { version = "1.2" }
+
+[profile.release-wasm]
+inherits = "release"
+lto = "fat"
+opt-level = "z"
