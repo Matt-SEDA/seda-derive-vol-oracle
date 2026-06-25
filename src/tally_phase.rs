@@ -6,7 +6,11 @@ use crate::execution_phase::ExecutionResult;
 
 /// Derive Volatility Surface Oracle — Tally Phase
 ///
-/// Aggregates vol data from multiple executors into a consensus vol surface.
+/// Aggregates vol data from multiple executors:
+///   1. Median spot across executors × sources
+///   2. Median DVOL and RV
+///   3. Vol risk premium (DVOL - RV)
+///   4. Regime classification
 
 const REGIME_LOW: f64 = 30.0;
 const REGIME_ELEVATED: f64 = 60.0;
@@ -18,28 +22,12 @@ struct VolSurface {
     cy: String,
     /// Consensus spot (USD)
     spot: f64,
-    /// DVOL index (%)
+    /// DVOL index (% — Deribit's 30-day synthetic ATM IV)
     dvol: f64,
     /// Realized vol (%)
     rv: f64,
-    /// Vol risk premium: DVOL - RV
+    /// Vol risk premium: DVOL - RV (positive = options expensive)
     vrp: f64,
-    /// ATM IV: average of call + put IV (%)
-    atm: f64,
-    /// ATM call IV (%)
-    ac: f64,
-    /// ATM put IV (%)
-    ap: f64,
-    /// Put-call IV spread (put IV - call IV, positive = put premium)
-    skew: f64,
-    /// ATM call delta
-    cd: f64,
-    /// ATM put delta
-    pd: f64,
-    /// ATM gamma
-    gm: f64,
-    /// ATM vega
-    vg: f64,
     /// Vol regime
     regime: String,
     /// Regime score 0-100
@@ -87,7 +75,7 @@ pub fn tally_phase() -> Result<()> {
     let reveals = get_reveals()?;
     let num_executors = reveals.len();
 
-    log!("Vol surface tally: {} reveals", num_executors);
+    log!("Vol tally: {} reveals", num_executors);
 
     let mut results: Vec<ExecutionResult> = Vec::new();
     for reveal in reveals {
@@ -118,31 +106,12 @@ pub fn tally_phase() -> Result<()> {
     let dvol = median_f64(&mut dvols);
     let mut rvs: Vec<f64> = results.iter().map(|r| r.rv).filter(|v| *v > 0.0).collect();
     let rv = median_f64(&mut rvs);
+
     let vrp = if dvol > 0.0 && rv > 0.0 { dvol - rv } else { 0.0 };
-
-    // Consensus ATM IVs
-    let mut call_ivs: Vec<f64> = results.iter().map(|r| r.ac).filter(|v| *v > 0.0).collect();
-    let atm_call = median_f64(&mut call_ivs);
-    let mut put_ivs: Vec<f64> = results.iter().map(|r| r.ap).filter(|v| *v > 0.0).collect();
-    let atm_put = median_f64(&mut put_ivs);
-    let atm_iv = if atm_call > 0.0 && atm_put > 0.0 { (atm_call + atm_put) / 2.0 } else { atm_call.max(atm_put) };
-    let skew = if atm_put > 0.0 && atm_call > 0.0 { atm_put - atm_call } else { 0.0 };
-
-    // Consensus greeks
-    let mut deltas_c: Vec<f64> = results.iter().map(|r| r.cd).filter(|v| *v != 0.0).collect();
-    let call_delta = median_f64(&mut deltas_c);
-    let mut deltas_p: Vec<f64> = results.iter().map(|r| r.pd).filter(|v| *v != 0.0).collect();
-    let put_delta = median_f64(&mut deltas_p);
-    let mut gammas: Vec<f64> = results.iter().map(|r| r.gm).filter(|v| *v > 0.0).collect();
-    let gamma = median_f64(&mut gammas);
-    let mut vegas: Vec<f64> = results.iter().map(|r| r.vg).filter(|v| *v > 0.0).collect();
-    let vega = median_f64(&mut vegas);
-
-    // Regime
     let (regime, rscore) = classify_regime(dvol, rv);
 
-    log!("Surface: spot=${:.2} DVOL={:.1}% RV={:.1}% ATM={:.1}% skew={:.1}% regime={}",
-        spot_usd, dvol, rv, atm_iv, skew, regime);
+    log!("spot=${:.2} DVOL={:.1}% RV={:.1}% VRP={:.1}% regime={}",
+        spot_usd, dvol, rv, vrp, regime);
 
     let round2 = |v: f64| ((v * 100.0).round()) / 100.0;
 
@@ -152,14 +121,6 @@ pub fn tally_phase() -> Result<()> {
         dvol: round2(dvol),
         rv: round2(rv),
         vrp: round2(vrp),
-        atm: round2(atm_iv),
-        ac: round2(atm_call),
-        ap: round2(atm_put),
-        skew: round2(skew),
-        cd: round2(call_delta),
-        pd: round2(put_delta),
-        gm: round2(gamma),
-        vg: round2(vega),
         regime,
         rscore,
         src: src_count,
